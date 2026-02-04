@@ -1,244 +1,206 @@
-"""Peer-AI command line interface."""
+#!/usr/bin/env python3
+"""Peer-AI CLI - AI-powered code review from the command line."""
 
+import argparse
+import json
 import sys
-from pathlib import Path
+import subprocess
+import requests
 from typing import Optional
 
-import click
-from rich.console import Console
-from rich.table import Table
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL = "peer-ai-raw"
 
-from peer_ai import __version__
-from peer_ai.model.reviewer import CodeReviewer
-from peer_ai.analyzers.diff import parse_diff
+def review_code(code: str, language: str = "unknown") -> dict:
+    """Send code to Peer-AI for review."""
+    # Add line numbers
+    lines = code.strip().split('\n')
+    numbered = '\n'.join(f"  {i+1} | {line}" for i, line in enumerate(lines))
+    
+    prompt = f"""Review the following {language} code for security vulnerabilities, bugs, and quality issues:
 
+```{language}
+{numbered}
+```
 
-console = Console()
+Analyze carefully and report any issues found."""
 
+    try:
+        resp = requests.post(OLLAMA_URL, json={
+            "model": MODEL,
+            "prompt": prompt,
+            "stream": False
+        }, timeout=120)
+        resp.raise_for_status()
+        return json.loads(resp.json().get("response", "{}"))
+    except Exception as e:
+        return {"error": str(e)}
 
-@click.group()
-@click.version_option(__version__)
+def detect_language(filename: str) -> str:
+    """Detect language from filename."""
+    ext_map = {
+        '.py': 'python', '.js': 'javascript', '.ts': 'typescript',
+        '.go': 'go', '.rs': 'rust', '.c': 'c', '.cpp': 'cpp',
+        '.h': 'c', '.hpp': 'cpp', '.java': 'java', '.rb': 'ruby',
+        '.php': 'php', '.sh': 'bash', '.sql': 'sql'
+    }
+    for ext, lang in ext_map.items():
+        if filename.endswith(ext):
+            return lang
+    return 'unknown'
+
+def parse_diff(diff: str) -> list:
+    """Parse unified diff into file chunks."""
+    chunks = []
+    current_file = None
+    current_code = []
+    current_lang = 'unknown'
+    
+    for line in diff.split('\n'):
+        if line.startswith('+++ b/'):
+            if current_file and current_code:
+                chunks.append({
+                    'file': current_file,
+                    'language': current_lang,
+                    'code': '\n'.join(current_code)
+                })
+            current_file = line[6:]
+            current_lang = detect_language(current_file)
+            current_code = []
+        elif line.startswith('+') and not line.startswith('+++'):
+            current_code.append(line[1:])
+    
+    if current_file and current_code:
+        chunks.append({
+            'file': current_file,
+            'language': current_lang,
+            'code': '\n'.join(current_code)
+        })
+    
+    return chunks
+
+def format_finding(finding: dict, filename: str = None) -> str:
+    """Format a finding for terminal output."""
+    severity = finding.get('severity', 'unknown').upper()
+    colors = {'CRITICAL': '\033[91m', 'HIGH': '\033[91m', 'MEDIUM': '\033[93m', 'LOW': '\033[94m'}
+    reset = '\033[0m'
+    color = colors.get(severity, '')
+    
+    parts = []
+    if filename:
+        parts.append(f"\033[1m{filename}\033[0m")
+    line = finding.get('line', '?')
+    parts.append(f":{line}")
+    parts.append(f" {color}[{severity}]{reset}")
+    
+    rule = finding.get('rule')
+    if rule:
+        parts.append(f" {rule}")
+    
+    title = finding.get('title', finding.get('message', 'Issue found'))
+    parts.append(f" - {title}")
+    
+    output = ''.join(parts)
+    
+    suggestion = finding.get('suggestion')
+    if suggestion:
+        output += f"\n  💡 {suggestion}"
+    
+    return output
+
 def main():
-    """Peer-AI: AI-powered code review for git workflows."""
-    pass
-
-
-@main.command()
-@click.argument("target", required=False)
-@click.option("--model", "-m", default="peer-ai/reviewer-1.5b", help="Model to use")
-@click.option("--language", "-l", multiple=True, help="Languages to analyze")
-@click.option("--severity", "-s", default="low", help="Minimum severity threshold")
-@click.option("--format", "-f", "output_format", default="rich", 
-              type=click.Choice(["rich", "json", "sarif", "github"]))
-@click.option("--diff/--no-diff", default=True, help="Treat input as diff")
-def review(
-    target: Optional[str],
-    model: str,
-    language: tuple[str, ...],
-    severity: str,
-    output_format: str,
-    diff: bool,
-):
-    """Review code for issues.
+    parser = argparse.ArgumentParser(
+        description='Peer-AI: AI-powered code review',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  git diff | peer-ai review -
+  peer-ai review src/main.py
+  peer-ai review --diff HEAD~1
+        """
+    )
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
     
-    TARGET can be a file path or '-' for stdin (pipe a diff).
+    # Review command
+    review_parser = subparsers.add_parser('review', help='Review code for issues')
+    review_parser.add_argument('target', nargs='?', default='-',
+                              help='File to review, - for stdin, or --diff for git diff')
+    review_parser.add_argument('--diff', '-d', metavar='REF',
+                              help='Review git diff against REF (e.g., HEAD~1, main)')
+    review_parser.add_argument('--json', '-j', action='store_true',
+                              help='Output raw JSON')
+    review_parser.add_argument('--language', '-l',
+                              help='Override language detection')
     
-    Examples:
+    args = parser.parse_args()
     
-        # Review a diff from git
-        git diff main..feature | peer-ai review -
-        
-        # Review staged changes
-        git diff --cached | peer-ai review -
-        
-        # Review a file directly
-        peer-ai review src/main.c
-    """
-    # Read input
-    if target == "-" or target is None:
-        if sys.stdin.isatty():
-            console.print("[yellow]Reading from stdin... (pipe a diff or Ctrl+D to finish)[/]")
-        content = sys.stdin.read()
-    else:
-        path = Path(target)
-        if not path.exists():
-            console.print(f"[red]Error: File not found: {target}[/]")
-            raise SystemExit(1)
-        content = path.read_text()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
     
-    if not content.strip():
-        console.print("[yellow]No input provided.[/]")
-        return
-    
-    # Initialize reviewer
-    console.print(f"[dim]Loading model: {model}[/]")
-    reviewer = CodeReviewer(model_name=model)
-    
-    # Parse and review
-    if diff:
-        files = parse_diff(content)
+    if args.command == 'review':
         findings = []
-        for file_path, hunks in files.items():
-            console.print(f"[dim]Reviewing: {file_path}[/]")
-            for hunk in hunks:
-                results = reviewer.review(hunk["content"], file_path=file_path, line_offset=hunk["start_line"])
-                findings.extend(results)
-    else:
-        findings = reviewer.review(content, file_path=target or "stdin")
-    
-    # Filter by severity
-    severity_order = ["low", "medium", "high", "critical"]
-    min_severity = severity_order.index(severity)
-    findings = [f for f in findings if severity_order.index(f.severity) >= min_severity]
-    
-    # Output
-    if output_format == "rich":
-        _print_rich(findings)
-    elif output_format == "json":
-        _print_json(findings)
-    elif output_format == "sarif":
-        _print_sarif(findings)
-    elif output_format == "github":
-        _print_github(findings)
-    
-    # Exit code based on findings
-    if any(f.severity in ("high", "critical") for f in findings):
-        raise SystemExit(1)
+        
+        if args.diff:
+            # Git diff mode
+            result = subprocess.run(
+                ['git', 'diff', args.diff],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                print(f"Error: git diff failed: {result.stderr}", file=sys.stderr)
+                sys.exit(1)
+            
+            chunks = parse_diff(result.stdout)
+            for chunk in chunks:
+                finding = review_code(chunk['code'], chunk['language'])
+                if finding and 'error' not in finding:
+                    finding['_file'] = chunk['file']
+                    findings.append(finding)
+        
+        elif args.target == '-':
+            # Stdin mode (could be diff or raw code)
+            content = sys.stdin.read()
+            if content.startswith('diff --git') or content.startswith('--- '):
+                chunks = parse_diff(content)
+                for chunk in chunks:
+                    finding = review_code(chunk['code'], chunk['language'])
+                    if finding and 'error' not in finding:
+                        finding['_file'] = chunk['file']
+                        findings.append(finding)
+            else:
+                lang = args.language or 'unknown'
+                finding = review_code(content, lang)
+                if finding and 'error' not in finding:
+                    findings.append(finding)
+        
+        else:
+            # File mode
+            try:
+                with open(args.target) as f:
+                    content = f.read()
+                lang = args.language or detect_language(args.target)
+                finding = review_code(content, lang)
+                if finding and 'error' not in finding:
+                    finding['_file'] = args.target
+                    findings.append(finding)
+            except FileNotFoundError:
+                print(f"Error: File not found: {args.target}", file=sys.stderr)
+                sys.exit(1)
+        
+        # Output
+        if args.json:
+            print(json.dumps(findings, indent=2))
+        else:
+            if not findings:
+                print("✅ No issues found")
+            else:
+                for f in findings:
+                    filename = f.pop('_file', None)
+                    print(format_finding(f, filename))
+                print(f"\n🔍 Found {len(findings)} issue(s)")
+        
+        sys.exit(1 if findings else 0)
 
-
-def _print_rich(findings):
-    """Print findings in rich table format."""
-    if not findings:
-        console.print("[green]✓ No issues found![/]")
-        return
-    
-    table = Table(title=f"Found {len(findings)} issue(s)")
-    table.add_column("Severity", style="bold")
-    table.add_column("Location")
-    table.add_column("Issue")
-    table.add_column("Rule")
-    
-    severity_colors = {
-        "critical": "red bold",
-        "high": "red",
-        "medium": "yellow",
-        "low": "blue",
-    }
-    
-    for f in findings:
-        table.add_row(
-            f"[{severity_colors[f.severity]}]{f.severity.upper()}[/]",
-            f"{f.file}:{f.line}",
-            f.message[:60] + "..." if len(f.message) > 60 else f.message,
-            f.rule or "-",
-        )
-    
-    console.print(table)
-    
-    # Print details
-    console.print("\n[bold]Details:[/]\n")
-    for i, f in enumerate(findings, 1):
-        console.print(f"[bold]{i}. {f.title}[/]")
-        console.print(f"   [dim]{f.file}:{f.line}[/]")
-        console.print(f"   {f.message}")
-        if f.suggestion:
-            console.print(f"   [green]Suggestion:[/] {f.suggestion}")
-        console.print()
-
-
-def _print_json(findings):
-    """Print findings as JSON."""
-    import json
-    data = [f.model_dump() for f in findings]
-    console.print_json(json.dumps(data, indent=2))
-
-
-def _print_sarif(findings):
-    """Print findings in SARIF format for GitHub code scanning."""
-    import json
-    sarif = {
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": "peer-ai",
-                    "version": __version__,
-                    "informationUri": "https://github.com/antonioinnovateops/peer-ai",
-                }
-            },
-            "results": [
-                {
-                    "ruleId": f.rule or "peer-ai/generic",
-                    "level": {"critical": "error", "high": "error", "medium": "warning", "low": "note"}[f.severity],
-                    "message": {"text": f.message},
-                    "locations": [{
-                        "physicalLocation": {
-                            "artifactLocation": {"uri": f.file},
-                            "region": {"startLine": f.line}
-                        }
-                    }]
-                }
-                for f in findings
-            ]
-        }]
-    }
-    console.print_json(json.dumps(sarif, indent=2))
-
-
-def _print_github(findings):
-    """Print findings as GitHub Actions workflow commands."""
-    for f in findings:
-        level = {"critical": "error", "high": "error", "medium": "warning", "low": "notice"}[f.severity]
-        message = f.message.replace("\n", "%0A")
-        print(f"::{level} file={f.file},line={f.line},title={f.title}::{message}")
-
-
-@main.command()
-@click.option("--host", "-h", default="0.0.0.0", help="Host to bind to")
-@click.option("--port", "-p", default=8080, help="Port to listen on")
-@click.option("--config", "-c", type=click.Path(exists=True), help="Config file")
-def serve(host: str, port: int, config: Optional[str]):
-    """Start the webhook server."""
-    import uvicorn
-    from peer_ai.server.app import create_app
-    
-    app = create_app(config_path=config)
-    console.print(f"[green]Starting Peer-AI server on {host}:{port}[/]")
-    uvicorn.run(app, host=host, port=port)
-
-
-@main.group()
-def data():
-    """Training data management."""
-    pass
-
-
-@data.command("generate")
-@click.option("--output", "-o", default="data/train.jsonl", help="Output file")
-@click.option("--sources", "-s", multiple=True, 
-              default=["cve", "github-advisories", "cwe"],
-              help="Data sources to use")
-@click.option("--limit", "-n", default=10000, help="Max samples per source")
-def data_generate(output: str, sources: tuple[str, ...], limit: int):
-    """Generate training data from security databases."""
-    from peer_ai.model.data import generate_training_data
-    
-    console.print(f"[bold]Generating training data from: {', '.join(sources)}[/]")
-    generate_training_data(output_path=output, sources=list(sources), limit=limit)
-    console.print(f"[green]✓ Saved to {output}[/]")
-
-
-@main.command()
-@click.option("--config", "-c", default="configs/training.yaml", help="Training config")
-@click.option("--resume", "-r", type=click.Path(exists=True), help="Resume from checkpoint")
-def train(config: str, resume: Optional[str]):
-    """Fine-tune the code review model."""
-    from peer_ai.model.train import train_model
-    
-    console.print(f"[bold]Starting training with config: {config}[/]")
-    train_model(config_path=config, resume_from=resume)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
