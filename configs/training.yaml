@@ -1,0 +1,52 @@
+# Peer-AI Training Configuration
+
+model:
+  # Base model to fine-tune
+  name: Qwen/Qwen2.5-Coder-1.5B-Instruct
+  # Quantization: 4bit, 8bit, or null for full precision
+  quantization: 4bit
+  # Max sequence length
+  max_length: 4096
+
+lora:
+  # LoRA rank (higher = more capacity, more memory)
+  r: 16
+  # LoRA alpha (scaling factor)
+  alpha: 32
+  # Dropout for regularization
+  dropout: 0.05
+  # Modules to apply LoRA to
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+training:
+  # Output directory for checkpoints
+  output_dir: models/peer-ai-reviewer
+  # Number of training epochs
+  epochs: 3
+  # Batch size per device
+  batch_size: 4
+  # Gradient accumulation steps (effective batch = batch_size * gradient_accumulation)
+  gradient_accumulation: 4
+  # Learning rate
+  learning_rate: 2e-4
+  # Warmup ratio
+  warmup_ratio: 0.03
+  # Logging frequency
+  logging_steps: 10
+  # Checkpoint save frequency
+  save_steps: 100
+  # Evaluation frequency
+  eval_steps: 100
+
+data:
+  # Training data
+  train_file: data/train.jsonl
+  # Evaluation data (optional)
+  eval_file: data/eval.jsonl

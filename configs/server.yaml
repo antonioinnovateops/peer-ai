@@ -1,0 +1,43 @@
+# Peer-AI Server Configuration
+
+model:
+  # Model to use for reviews
+  name: peer-ai/reviewer-1.5b
+  # Device: cuda, cpu, or specific GPU like cuda:0
+  device: cuda
+  # Optional: quantization for memory efficiency
+  quantization: 4bit
+
+server:
+  host: 0.0.0.0
+  port: 8080
+
+# GitHub App integration
+github:
+  # Create a GitHub App at https://github.com/settings/apps
+  app_id: ${PEER_AI_GITHUB_APP_ID}
+  private_key_path: ./github-app.pem
+  webhook_secret: ${PEER_AI_GITHUB_WEBHOOK_SECRET}
+
+# GitLab integration
+gitlab:
+  # Create an access token with api scope
+  token: ${PEER_AI_GITLAB_TOKEN}
+  url: https://gitlab.com
+  webhook_secret: ${PEER_AI_GITLAB_WEBHOOK_SECRET}
+
+# Review settings
+review:
+  # Languages to analyze
+  languages:
+    - c
+    - cpp
+    - rust
+    - python
+    - go
+  # Minimum severity to report (low, medium, high, critical)
+  severity_threshold: low
+  # Auto-approve PRs with no high/critical issues
+  auto_approve: false
+  # Maximum comments per PR (to avoid spam)
+  max_comments_per_pr: 20
